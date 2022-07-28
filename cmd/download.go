@@ -9,60 +9,80 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/k0kubun/go-ansi"
 	"github.com/schollz/progressbar/v3"
 	"github.com/spf13/cobra"
 )
 
-func Download(cmd *cobra.Command, args []string) {
-	url, _ := cmd.Flags().GetString("url")
-	filename, _ := cmd.Flags().GetString("output")
-	concurrency, _ := cmd.Flags().GetInt("concurrency")
-	resume, _ := cmd.Flags().GetBool("resume")
+const UserAgent = `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/51.0.2704.103 Safari/537.36`
 
-	fmt.Printf("[url] %v\n[filename] %v\n[concurrency] %v\n", url, filename, concurrency)
+func DownloadFunc(cmd *cobra.Command, args []string) {
+	downloader := NewDownloader(concurrencyFlag, resumeFlag)
 
-	NewDownloader(concurrency, resume).Download(url, filename)
+	// 下载链接
+	if urlFlag == "" {
+		downloader.url = args[0]
+	} else {
+		downloader.url = urlFlag
+	}
+
+	// 文件名与输出路径
+	if outputFlag == "" {
+		downloader.filename = path.Base(downloader.url)
+	} else {
+		downloader.dirname, downloader.filename = path.Split(outputFlag)
+	}
+	fmt.Println("Dirname:", downloader.dirname, "Filename:", downloader.filename)
+
+	res, err := http.Head(downloader.url)
+	CheckErr(err)
+	downloader.contentLength = int(res.ContentLength)
+	fmt.Println("Size:", res.ContentLength, "bytes")
+	if res.StatusCode == http.StatusOK && res.Header.Get("Accept-Ranges") == "bytes" {
+		downloader.acceptRanges = true
+	} else {
+		downloader.acceptRanges = false
+	}
+
+	downloader.setBar(downloader.contentLength)
+
+	downloader.Download()
 }
 
 type Downloader struct {
-	concurrency int
-	resume      bool
+	url         string // 链接
+	filename    string // 文件名
+	dirname     string // 保存目录名
+	concurrency int    // 并发数
+	resume      bool   // 是否断点续传
 
-	bar *progressbar.ProgressBar
+	contentLength int  // 文件总大小
+	acceptRanges  bool // 服务端是否支持 Ranges
+
+	bar *progressbar.ProgressBar // 下载进度条
 }
 
 func NewDownloader(concurrency int, resume bool) *Downloader {
 	return &Downloader{concurrency: concurrency, resume: resume}
 }
 
-func (d *Downloader) Download(url, filename string) error {
-	if filename == "" {
-		filename = path.Base(url)
+func (d *Downloader) Download() error {
+	if d.acceptRanges {
+		fmt.Println("Mode: multi")
+		return d.multiDownload()
+	} else {
+		fmt.Println("Mode: single")
+		return d.singleDownload()
 	}
-
-	resp, err := http.Head(url)
-	if err != nil {
-		fmt.Println(err)
-		return nil
-	}
-
-	if resp.StatusCode == http.StatusOK && resp.Header.Get("Accept-Ranges") == "bytes" {
-		fmt.Println("[mode] multi")
-		return d.multiDownload(url, filename, int(resp.ContentLength))
-	}
-
-	fmt.Println("[mode] single")
-	return d.singleDownload(url, filename)
 }
 
-func (d *Downloader) multiDownload(url, filename string, contentLen int) error {
-	d.setBar(contentLen)
+func (d *Downloader) multiDownload() error {
+	partSize := d.contentLength / d.concurrency
+	fmt.Println("Part Size:", partSize, "bytes")
 
-	partSize := contentLen / d.concurrency
-
-	partDir := d.getPartDir(filename)
+	partDir := d.getPartDir()
 	os.Mkdir(partDir, 0777)
 	defer os.RemoveAll(partDir)
 
@@ -75,60 +95,62 @@ func (d *Downloader) multiDownload(url, filename string, contentLen int) error {
 		go func(i, rangeStart int) {
 			defer wg.Done()
 
-			rangeEnd := rangeStart + partSize
+			// 范围是 i*size ~ (i+1)*size-1
+			rangeStart = i * partSize
+			rangeEnd := rangeStart + partSize - 1
+
+			// 若是最后一部分，则设置范围到文件总长度
 			if i == d.concurrency-1 {
-				rangeEnd = contentLen
+				rangeEnd = d.contentLength - 1
 			}
 
+			// 当前分片已下载量
 			downloaded := 0
+			// 是否继续下载
 			if d.resume {
-				partFileName := d.getPartFilename(filename, i)
+				partFileName := d.getPartFilename(i)
 				content, err := os.ReadFile(partFileName)
 				if err == nil {
 					downloaded = len(content)
 				}
+				// 设置进度条中已下载的部分
 				d.bar.Add(downloaded)
 			}
 
-			d.downloadPartial(url, filename, rangeStart, rangeEnd, i)
+			// TODO resume
+			d.downloadPartial(rangeStart, rangeEnd, i)
 		}(i, rangeStart)
-
-		rangeStart += partSize + 1
 	}
 
+	// 等待全部分片下载完成
 	wg.Wait()
 
-	d.merge(filename)
+	// 合并文件
+	d.merge()
 
 	return nil
 }
 
-func (d *Downloader) singleDownload(url, filename string) error {
-	resp, err := http.Get(url)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
+func (d *Downloader) singleDownload() error {
+	res, err := http.Get(d.url)
+	CheckErr(err)
+	defer res.Body.Close()
 
-	d.setBar(int(resp.ContentLength))
-
-	f, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY, 0666)
-	if err != nil {
-		return err
-	}
+	f, err := os.OpenFile(d.filename, os.O_CREATE|os.O_WRONLY, 0666)
+	CheckErr(err)
 	defer f.Close()
 
-	buf := make([]byte, 32*1024)
-	_, err = io.CopyBuffer(io.MultiWriter(f, d.bar), resp.Body, buf)
+	buf := make([]byte, 32*1024) // 32 KB
+	_, err = io.CopyBuffer(io.MultiWriter(f, d.bar), res.Body, buf)
 	return err
 }
 
-func (d *Downloader) downloadPartial(url, filename string, rangeStart, rangeEnd, i int) {
+func (d *Downloader) downloadPartial(rangeStart, rangeEnd, i int) {
 	if rangeStart >= rangeEnd {
 		return
 	}
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest("GET", d.url, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -144,7 +166,7 @@ func (d *Downloader) downloadPartial(url, filename string, rangeStart, rangeEnd,
 	if d.resume {
 		flags |= os.O_APPEND
 	}
-	partFile, err := os.OpenFile(d.getPartFilename(filename, i), flags, 0666)
+	partFile, err := os.OpenFile(d.getPartFilename(i), flags, 0666)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -159,29 +181,28 @@ func (d *Downloader) downloadPartial(url, filename string, rangeStart, rangeEnd,
 	}
 }
 
-func (d *Downloader) getPartDir(filename string) string {
-	return strings.SplitN(filename, ".", 2)[0]
+// 获取分片文件夹名称
+func (d *Downloader) getPartDir() string {
+	return strings.SplitN(d.filename, ".", 2)[0]
 }
 
-func (d *Downloader) getPartFilename(filename string, partNum int) string {
-	partDir := d.getPartDir(filename)
-	return fmt.Sprintf("%s/%s-%d", partDir, filename, partNum)
+// 获取分片文件名称
+func (d *Downloader) getPartFilename(partNum int) string {
+	partDir := d.getPartDir()
+	return fmt.Sprintf("%s/%s-%d", partDir, d.filename, partNum)
 }
 
 // merge 合并文件
-func (d *Downloader) merge(filename string) error {
+func (d *Downloader) merge() error {
+	filename := path.Join(d.dirname, d.filename)
 	dstFile, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY, 0666)
-	if err != nil {
-		return nil
-	}
+	CheckErr(err)
 	defer dstFile.Close()
 
 	for i := 0; i < d.concurrency; i++ {
-		partFilename := d.getPartFilename(filename, i)
+		partFilename := d.getPartFilename(i)
 		partFile, err := os.Open(partFilename)
-		if err != nil {
-			return err
-		}
+		CheckErr(err)
 		io.Copy(dstFile, partFile)
 		partFile.Close()
 		os.Remove(partFilename)
@@ -193,11 +214,18 @@ func (d *Downloader) merge(filename string) error {
 func (d *Downloader) setBar(length int) {
 	d.bar = progressbar.NewOptions(
 		length,
+		progressbar.OptionSpinnerType(11),
 		progressbar.OptionSetWriter(ansi.NewAnsiStdout()),
 		progressbar.OptionEnableColorCodes(true),
 		progressbar.OptionShowBytes(true),
-		progressbar.OptionSetWidth(50),
-		progressbar.OptionSetDescription("Downloading..."),
+		progressbar.OptionFullWidth(), // 进度条宽度
+		// progressbar.OptionSetWidth(50),
+		progressbar.OptionThrottle(200*time.Millisecond), // 再次更新之前等待时间
+		progressbar.OptionShowCount(),
+		progressbar.OptionShowIts(),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Printf("\n")
+		}),
 		progressbar.OptionSetTheme(progressbar.Theme{
 			Saucer:        "[green]=[reset]",
 			SaucerHead:    "[green]>[reset]",

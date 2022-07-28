@@ -10,9 +10,9 @@ var versionCmd = &cobra.Command{
 	Use:     "version",
 	Aliases: []string{"v"},
 	Short:   "version for this command",
-	Run:     Version,
+	Run:     VersionFunc,
 }
 
-func Version(cmd *cobra.Command, args []string) {
+func VersionFunc(cmd *cobra.Command, args []string) {
 	fmt.Println(version)
 }

@@ -1,8 +1,7 @@
-.vscode/
-.draft/
-build/
-test.go
-gdm
-*.exe
-*.zip
-*.7z
+*
+!cmd/**
+!.gitignore
+!gdm.go
+!go.mod
+!go.sum
+!README.md
